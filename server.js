@@ -213,7 +213,7 @@ function cookieJarToHeader(cookieJar) {
 
 function getForwardableHeaders(format) {
   const headers = {};
-  const rawHeaders = format?.http_headers;
+  const rawHeaders = format?.http_headers || format?.headers;
 
   if (rawHeaders && typeof rawHeaders === "object") {
     for (const [key, value] of Object.entries(rawHeaders)) {
@@ -234,6 +234,73 @@ function getForwardableHeaders(format) {
   if (cookieHeader) headers.Cookie = cookieHeader;
 
   return headers;
+}
+
+function mintAssetToken(url, headers = {}) {
+  const payload = {
+    url: String(url),
+    expiresAt: Date.now() + STREAM_TOKEN_TTL_MS,
+    headers,
+  };
+
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function parseAssetToken(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(token), "base64url").toString("utf8"));
+    if (!payload || typeof payload !== "object") return null;
+    if (typeof payload.url !== "string") return null;
+    if (typeof payload.expiresAt !== "number" || payload.expiresAt <= Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function findThumbnailUrl(metadata) {
+  if (typeof metadata?.thumbnail === "string" && /^https?:\/\//i.test(metadata.thumbnail)) {
+    return metadata.thumbnail;
+  }
+
+  if (Array.isArray(metadata?.thumbnails)) {
+    for (const thumb of metadata.thumbnails) {
+      if (typeof thumb?.url === "string" && /^https?:\/\//i.test(thumb.url)) {
+        return thumb.url;
+      }
+    }
+  }
+
+  return null;
+}
+
+function resolveThumbnailHeaders(metadata, sourceUrl) {
+  const fromMetadata = getForwardableHeaders(metadata || {});
+  if (Object.keys(fromMetadata).length) return fromMetadata;
+
+  if (Array.isArray(metadata?.formats)) {
+    for (const format of metadata.formats) {
+      const headers = getForwardableHeaders(format || {});
+      if (Object.keys(headers).length) return headers;
+    }
+  }
+
+  const fallback = {};
+  const platform = getPlatformFromUrl(sourceUrl || "");
+  if (platform === "instagram") {
+    fallback.Referer = "https://www.instagram.com/";
+    fallback.Accept = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
+  }
+  return fallback;
+}
+
+function buildThumbnailProxyUrl(metadata, sourceUrl, baseUrl) {
+  const thumbnail = findThumbnailUrl(metadata);
+  if (!thumbnail) return null;
+
+  const headers = resolveThumbnailHeaders(metadata, sourceUrl);
+  const token = mintAssetToken(thumbnail, headers);
+  return `${baseUrl}/api/thumb?t=${encodeURIComponent(token)}`;
 }
 
 function mintStreamToken(format, title) {
@@ -299,10 +366,54 @@ app.post("/api/download", async (req, res, next) => {
     res.status(200).json({
       platform: getPlatformFromUrl(url),
       title: metadata?.title || null,
-      thumbnail: metadata?.thumbnail || null,
+      thumbnail: buildThumbnailProxyUrl(metadata, url, baseUrl),
       formats: normalizeFormats(metadata?.formats, metadata?.title || "video", baseUrl),
     });
   } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/thumb", async (req, res, next) => {
+  try {
+    const payload = parseAssetToken(req.query.t);
+    if (!payload) {
+      return res.status(404).json({ error: "invalid or expired thumbnail token" });
+    }
+
+    const headers = {
+      ...(payload.headers || {}),
+    };
+
+    if (!Object.keys(headers).some((key) => key.toLowerCase() === "user-agent")) {
+      headers["User-Agent"] =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    }
+
+    const upstream = await fetch(payload.url, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    if (!upstream.ok) {
+      return res.status(502).json({ error: "thumbnail upstream error", status: upstream.status });
+    }
+
+    const contentType = upstream.headers.get("content-type");
+    const contentLength = upstream.headers.get("content-length");
+    if (contentType) res.setHeader("Content-Type", contentType);
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.status(200);
+
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (error) {
+    if (error?.name === "TimeoutError") {
+      return res.status(504).json({ error: "thumbnail request timed out" });
+    }
     next(error);
   }
 });
