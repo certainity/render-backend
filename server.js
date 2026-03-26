@@ -51,6 +51,43 @@ function sanitizeUrl(input) {
   return parsed.toString();
 }
 
+function getPlatformFromUrl(input) {
+  try {
+    const hostname = new URL(input).hostname.toLowerCase();
+
+    if (
+      hostname === "youtube.com" ||
+      hostname.endsWith(".youtube.com") ||
+      hostname === "youtu.be" ||
+      hostname.endsWith(".youtu.be") ||
+      hostname === "youtube-nocookie.com" ||
+      hostname.endsWith(".youtube-nocookie.com")
+    ) {
+      return "youtube";
+    }
+
+    if (hostname === "x.com" || hostname.endsWith(".x.com") || hostname === "twitter.com" || hostname.endsWith(".twitter.com")) {
+      return "twitter";
+    }
+
+    if (hostname === "tiktok.com" || hostname.endsWith(".tiktok.com")) {
+      return "tiktok";
+    }
+
+    if (hostname === "facebook.com" || hostname.endsWith(".facebook.com") || hostname === "fb.watch") {
+      return "facebook";
+    }
+
+    if (hostname === "instagram.com" || hostname.endsWith(".instagram.com")) {
+      return "instagram";
+    }
+
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 function escapeShellArg(value) {
   return `"${String(value).replace(/(["\\$`])/g, "\\$1")}"`;
 }
@@ -260,6 +297,7 @@ app.post("/api/download", async (req, res, next) => {
     const baseUrl = getPublicBaseUrl(req);
 
     res.status(200).json({
+      platform: getPlatformFromUrl(url),
       title: metadata?.title || null,
       thumbnail: metadata?.thumbnail || null,
       formats: normalizeFormats(metadata?.formats, metadata?.title || "video", baseUrl),
