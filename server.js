@@ -159,6 +159,16 @@ function runYtDlp(url, requestId) {
             return reject(timeoutError);
           }
 
+          const stderrText = String(stderr || "").toLowerCase();
+          if (stderrText.includes("[facebook]") && stderrText.includes("no video formats found")) {
+            const fbError = new Error(
+              "This Facebook video is unavailable for direct download (private/restricted/login-required). Try a public Facebook video permalink."
+            );
+            fbError.statusCode = 422;
+            fbError.details = stderr ? stderr.trim() : error.message;
+            return reject(fbError);
+          }
+
           const commandError = new Error("failed to fetch video metadata");
           commandError.statusCode = 502;
           commandError.details = stderr ? stderr.trim() : error.message;
