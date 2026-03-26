@@ -51,6 +51,49 @@ function sanitizeUrl(input) {
   return parsed.toString();
 }
 
+function tryExtractFacebookVideoId(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (!host.includes("facebook.com") && host !== "fb.watch") return null;
+
+    const pathname = parsed.pathname || "";
+    const watchId = parsed.searchParams.get("v");
+    if (watchId && /^\d+$/.test(watchId)) return watchId;
+
+    const patterns = [
+      /\/share\/v\/([A-Za-z0-9._-]+)/i,
+      /\/reel\/(\d+)/i,
+      /\/videos\/(\d+)/i,
+      /\/watch\/\?v=(\d+)/i,
+      /^\/([^/]+)$/i, // fb.watch short path
+    ];
+
+    for (const pattern of patterns) {
+      const match = `${pathname}${parsed.search}`.match(pattern) || pathname.match(pattern);
+      if (match && match[1]) return match[1];
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function normalizeFacebookUrl(url) {
+  const videoId = tryExtractFacebookVideoId(url);
+  if (!videoId) return url;
+  return `https://www.facebook.com/watch/?v=${encodeURIComponent(videoId)}`;
+}
+
+function buildYtDlpCommand(url) {
+  const platform = getPlatformFromUrl(url);
+  const base = `${YTDLP_BIN} -j --no-playlist --no-warnings --socket-timeout 15`;
+  if (platform === "facebook") {
+    return `${base} --add-header "Referer:https://www.facebook.com/" --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" ${escapeShellArg(url)}`;
+  }
+  return `${base} ${escapeShellArg(url)}`;
+}
+
 function getPlatformFromUrl(input) {
   try {
     const hostname = new URL(input).hostname.toLowerCase();
@@ -93,7 +136,7 @@ function escapeShellArg(value) {
 }
 
 function runYtDlp(url, requestId) {
-  const command = `${YTDLP_BIN} -j --no-playlist --no-warnings --socket-timeout 15 ${escapeShellArg(url)}`;
+  const command = buildYtDlpCommand(url);
   console.log(`[${requestId}] executing: ${command}`);
 
   return new Promise((resolve, reject) => {
@@ -359,14 +402,26 @@ function normalizeFormats(rawFormats, title, baseUrl) {
 
 app.post("/api/download", async (req, res, next) => {
   try {
-    const url = sanitizeUrl(req.body?.url);
-    const metadata = await runYtDlp(url, req.requestId);
+    const originalUrl = sanitizeUrl(req.body?.url);
+    const normalizedUrl = getPlatformFromUrl(originalUrl) === "facebook" ? normalizeFacebookUrl(originalUrl) : originalUrl;
+    let metadata;
+
+    try {
+      metadata = await runYtDlp(normalizedUrl, req.requestId);
+    } catch (error) {
+      // Retry Facebook once with the original URL if normalized URL fails.
+      if (getPlatformFromUrl(originalUrl) === "facebook" && normalizedUrl !== originalUrl) {
+        metadata = await runYtDlp(originalUrl, req.requestId);
+      } else {
+        throw error;
+      }
+    }
     const baseUrl = getPublicBaseUrl(req);
 
     res.status(200).json({
-      platform: getPlatformFromUrl(url),
+      platform: getPlatformFromUrl(originalUrl),
       title: metadata?.title || null,
-      thumbnail: buildThumbnailProxyUrl(metadata, url, baseUrl),
+      thumbnail: buildThumbnailProxyUrl(metadata, originalUrl, baseUrl),
       formats: normalizeFormats(metadata?.formats, metadata?.title || "video", baseUrl),
     });
   } catch (error) {
