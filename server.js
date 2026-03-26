@@ -406,7 +406,8 @@ function normalizeFormats(rawFormats, title, baseUrl) {
       format_id: String(format.format_id),
       ext: guessExt(format),
       quality: getQualityLabel(format),
-      url: `${baseUrl}/api/stream?t=${encodeURIComponent(mintStreamToken(format, title))}`,
+      previewUrl: `${baseUrl}/api/stream?t=${encodeURIComponent(mintStreamToken(format, title))}&inline=1`,
+      url: `${baseUrl}/api/stream?t=${encodeURIComponent(mintStreamToken(format, title))}&download=1`,
     }));
 }
 
@@ -530,10 +531,19 @@ app.get("/api/stream", async (req, res, next) => {
     if (contentRange) res.setHeader("Content-Range", contentRange);
 
     const asciiFilename = payload.filename.replace(/[^\x20-\x7E]+/g, "").replace(/"/g, "").trim() || "video.mp4";
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(payload.filename)}`
-    );
+    const isInline = String(req.query.inline || "") === "1";
+    const shouldDownload = String(req.query.download || "") === "1";
+    if (shouldDownload && !isInline) {
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(payload.filename)}`
+      );
+    } else {
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(payload.filename)}`
+      );
+    }
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "no-store");
     res.status(upstream.status === 206 ? 206 : 200);
