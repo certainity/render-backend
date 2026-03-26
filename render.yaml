@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: video-downloader-api
+    env: node
+    plan: free
+    rootDir: render-backend
+    buildCommand: npm install && pip install yt-dlp
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: REQUEST_TIMEOUT_MS
+        value: 25000
