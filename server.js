@@ -1,11 +1,13 @@
 const express = require("express");
 const cors = require("cors");
 const { exec } = require("child_process");
+const { Readable } = require("stream");
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 25000;
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
+const STREAM_TOKEN_TTL_MS = Number(process.env.STREAM_TOKEN_TTL_MS) || 60 * 60 * 1000;
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -99,21 +101,155 @@ function runYtDlp(url, requestId) {
   });
 }
 
-function normalizeFormats(rawFormats) {
+function getPublicBaseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
+
+function safeFilename(input) {
+  return String(input || "video")
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "video";
+}
+
+function guessExt(format) {
+  if (format?.ext) return String(format.ext).toLowerCase();
+  try {
+    const pathname = new URL(format?.url || "").pathname;
+    const ext = pathname.split(".").pop();
+    if (ext) return ext.toLowerCase();
+  } catch {
+    // ignore
+  }
+  return "mp4";
+}
+
+function inferHeight(format) {
+  if (typeof format?.height === "number") return format.height;
+
+  const resolution = typeof format?.resolution === "string" ? format.resolution : "";
+  const match = resolution.match(/(\d{3,4})$/);
+  if (match) return Number(match[1]);
+
+  const text = [format?.format_note, format?.format, format?.format_id]
+    .filter((value) => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+
+  if (/\b1080p\b/.test(text)) return 1080;
+  if (/\b1024p\b/.test(text)) return 1024;
+  if (/\b720p\b|\bhd\b/.test(text)) return 720;
+  if (/\b540p\b/.test(text)) return 540;
+  if (/\b480p\b/.test(text)) return 480;
+  if (/\b360p\b|\bsd\b/.test(text)) return 360;
+  return null;
+}
+
+function getQualityLabel(format) {
+  const height = inferHeight(format);
+  if (height) return `${height}p`;
+  return format?.format_note || format?.resolution || format?.format || "unknown";
+}
+
+function cookieJarToHeader(cookieJar) {
+  const reserved = new Set(["domain", "path", "expires", "max-age", "secure", "httponly", "samesite"]);
+
+  const pairs = String(cookieJar || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const eqIndex = part.indexOf("=");
+      if (eqIndex <= 0) return null;
+      const key = part.slice(0, eqIndex).trim();
+      const value = part.slice(eqIndex + 1).trim().replace(/^"|"$/g, "");
+      if (!key || reserved.has(key.toLowerCase())) return null;
+      return `${key}=${value}`;
+    })
+    .filter(Boolean);
+
+  return pairs.length ? pairs.join("; ") : null;
+}
+
+function getForwardableHeaders(format) {
+  const headers = {};
+  const rawHeaders = format?.http_headers;
+
+  if (rawHeaders && typeof rawHeaders === "object") {
+    for (const [key, value] of Object.entries(rawHeaders)) {
+      if (typeof value !== "string") continue;
+      const normalized = key.toLowerCase();
+      if (
+        normalized === "user-agent" ||
+        normalized === "referer" ||
+        normalized === "accept" ||
+        normalized === "accept-language"
+      ) {
+        headers[key] = value;
+      }
+    }
+  }
+
+  const cookieHeader = cookieJarToHeader(format?.cookies);
+  if (cookieHeader) headers.Cookie = cookieHeader;
+
+  return headers;
+}
+
+function mintStreamToken(format, title) {
+  const ext = guessExt(format);
+  const filename = `${safeFilename(title)} ${safeFilename(getQualityLabel(format))}.${ext}`;
+  const payload = {
+    url: String(format.url),
+    filename,
+    expiresAt: Date.now() + STREAM_TOKEN_TTL_MS,
+    headers: getForwardableHeaders(format),
+  };
+
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function parseStreamToken(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(token), "base64url").toString("utf8"));
+    if (!payload || typeof payload !== "object") return null;
+    if (typeof payload.url !== "string" || typeof payload.filename !== "string") return null;
+    if (typeof payload.expiresAt !== "number" || payload.expiresAt <= Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeFormats(rawFormats, title, baseUrl) {
   if (!Array.isArray(rawFormats)) return [];
 
+  const seen = new Set();
+
   return rawFormats
-    .filter((format) => format && typeof format === "object" && format.format_id && format.url)
+    .filter((format) => {
+      if (!format || typeof format !== "object" || !format.format_id || !format.url) return false;
+      if (format.vcodec === "none") return false;
+      if (typeof format.url !== "string" || !/^https?:\/\//i.test(format.url)) return false;
+      const protocol = String(format.protocol || "").toLowerCase();
+      if (protocol.includes("m3u8")) return false;
+      return true;
+    })
+    .sort((a, b) => (inferHeight(b) || 0) - (inferHeight(a) || 0))
+    .filter((format) => {
+      const key = `${getQualityLabel(format)}::${guessExt(format)}::${inferHeight(format) || "na"}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
     .map((format) => ({
       format_id: String(format.format_id),
-      ext: format.ext || null,
-      quality:
-        format.format_note ||
-        format.resolution ||
-        (format.height ? `${format.height}p` : null) ||
-        format.format ||
-        "unknown",
-      url: String(format.url),
+      ext: guessExt(format),
+      quality: getQualityLabel(format),
+      url: `${baseUrl}/api/stream?t=${encodeURIComponent(mintStreamToken(format, title))}`,
     }));
 }
 
@@ -121,13 +257,78 @@ app.post("/api/download", async (req, res, next) => {
   try {
     const url = sanitizeUrl(req.body?.url);
     const metadata = await runYtDlp(url, req.requestId);
+    const baseUrl = getPublicBaseUrl(req);
 
     res.status(200).json({
       title: metadata?.title || null,
       thumbnail: metadata?.thumbnail || null,
-      formats: normalizeFormats(metadata?.formats),
+      formats: normalizeFormats(metadata?.formats, metadata?.title || "video", baseUrl),
     });
   } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/stream", async (req, res, next) => {
+  try {
+    const token = req.query.t;
+    const payload = parseStreamToken(token);
+
+    if (!payload) {
+      return res.status(404).json({ error: "invalid or expired token" });
+    }
+
+    const headers = {
+      ...(payload.headers || {}),
+    };
+
+    if (!Object.keys(headers).some((key) => key.toLowerCase() === "user-agent")) {
+      headers["User-Agent"] =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    }
+
+    if (!Object.keys(headers).some((key) => key.toLowerCase() === "accept")) {
+      headers.Accept = "*/*";
+    }
+
+    const range = req.headers.range;
+    if (range) headers.Range = range;
+
+    const upstream = await fetch(payload.url, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(502).json({ error: "upstream error", status: upstream.status });
+    }
+
+    const contentType = upstream.headers.get("content-type");
+    const contentLength = upstream.headers.get("content-length");
+    const acceptRanges = upstream.headers.get("accept-ranges");
+    const contentRange = upstream.headers.get("content-range");
+
+    if (contentType) res.setHeader("Content-Type", contentType);
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    if (acceptRanges) res.setHeader("Accept-Ranges", acceptRanges);
+    if (contentRange) res.setHeader("Content-Range", contentRange);
+
+    const asciiFilename = payload.filename.replace(/[^\x20-\x7E]+/g, "").replace(/"/g, "").trim() || "video.mp4";
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(payload.filename)}`
+    );
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "no-store");
+    res.status(upstream.status === 206 ? 206 : 200);
+
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (error) {
+    if (error?.name === "TimeoutError") {
+      return res.status(504).json({ error: "stream request timed out" });
+    }
     next(error);
   }
 });
@@ -156,4 +357,3 @@ const server = app.listen(PORT, () => {
 
 server.requestTimeout = REQUEST_TIMEOUT_MS + 5000;
 server.headersTimeout = REQUEST_TIMEOUT_MS + 10000;
-
