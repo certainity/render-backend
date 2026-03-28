@@ -21,6 +21,44 @@ Server runs on:
 http://localhost:3000
 ```
 
+## Local YouTube and Instagram testing
+
+For local YouTube and Instagram extraction, the most reliable Windows setup is a manual cookies file exported from a signed-in browser.
+
+Preferred setup:
+
+```bash
+$env:PORT=4000
+$env:YTDLP_COOKIES_FILE="C:\path\to\cookies.txt"
+node server.js
+```
+
+If you do not have a cookies file yet, browser-cookie mode is still supported:
+
+Example:
+
+```bash
+$env:PORT=4000
+$env:YTDLP_COOKIES_FROM_BROWSER="chrome"
+$env:YTDLP_BROWSER_PROFILE="Default"
+node server.js
+```
+
+If yt-dlp says it cannot copy the Chrome cookie database, fully close Chrome and retry. If that still fails, export a `cookies.txt` file and use `YTDLP_COOKIES_FILE` instead.
+
+Optional fallback if cookie decryption needs it:
+
+```bash
+$env:YTDLP_BROWSER_KEYRING="basic"
+```
+
+Pair this with the frontend local env:
+
+```env
+NEXT_PUBLIC_ENABLE_YOUTUBE_LOCAL=1
+NEXT_PUBLIC_API_BASE_URL=http://localhost:4000
+```
+
 ## Endpoints
 
 ### `GET /`

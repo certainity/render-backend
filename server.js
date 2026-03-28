@@ -2,12 +2,18 @@ const express = require("express");
 const cors = require("cors");
 const { exec } = require("child_process");
 const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 25000;
+const STREAM_FETCH_TIMEOUT_MS = Number(process.env.STREAM_FETCH_TIMEOUT_MS) || 10 * 60 * 1000;
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 const STREAM_TOKEN_TTL_MS = Number(process.env.STREAM_TOKEN_TTL_MS) || 60 * 60 * 1000;
+const YTDLP_COOKIES_FROM_BROWSER = (process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
+const YTDLP_BROWSER_PROFILE = (process.env.YTDLP_BROWSER_PROFILE || "").trim();
+const YTDLP_BROWSER_KEYRING = (process.env.YTDLP_BROWSER_KEYRING || "").trim();
+const YTDLP_COOKIES_FILE = (process.env.YTDLP_COOKIES_FILE || "").trim();
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -85,9 +91,44 @@ function normalizeFacebookUrl(url) {
   return `https://www.facebook.com/watch/?v=${encodeURIComponent(videoId)}`;
 }
 
-function buildYtDlpCommand(url) {
-  const platform = getPlatformFromUrl(url);
+function escapeShellArg(value) {
+  return `"${String(value).replace(/(["\\$`])/g, "\\$1")}"`;
+}
+
+function getYoutubeCookiesFromBrowserArg() {
+  if (!YTDLP_COOKIES_FROM_BROWSER) return "";
+
+  let browserDescriptor = YTDLP_COOKIES_FROM_BROWSER;
+  if (YTDLP_BROWSER_KEYRING) {
+    browserDescriptor += `+${YTDLP_BROWSER_KEYRING}`;
+  }
+  if (YTDLP_BROWSER_PROFILE) {
+    browserDescriptor += `:${YTDLP_BROWSER_PROFILE}`;
+  }
+
+  return ` --cookies-from-browser ${escapeShellArg(browserDescriptor)}`;
+}
+
+function getCookiesFileArg() {
+  if (!YTDLP_COOKIES_FILE) return "";
+  return ` --cookies ${escapeShellArg(YTDLP_COOKIES_FILE)}`;
+}
+
+function getAuthArgsForPlatform(platform) {
+  if (platform !== "youtube" && platform !== "instagram") return "";
+  return getCookiesFileArg() || getYoutubeCookiesFromBrowserArg();
+}
+
+function buildYtDlpCommand(url, options = {}) {
+  const platform = options.platform || getPlatformFromUrl(url);
   const base = `${YTDLP_BIN} -j --no-playlist --no-warnings --socket-timeout 15`;
+  if (platform === "youtube") {
+    return `${base}${getAuthArgsForPlatform(platform)} ${escapeShellArg(url)}`;
+  }
+  if (platform === "instagram") {
+    const authArgs = options.forceAuth ? getAuthArgsForPlatform(platform) : "";
+    return `${base}${authArgs} ${escapeShellArg(url)}`;
+  }
   if (platform === "facebook") {
     return `${base} --add-header "Referer:https://www.facebook.com/" --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" ${escapeShellArg(url)}`;
   }
@@ -117,6 +158,10 @@ function getPlatformFromUrl(input) {
       return "tiktok";
     }
 
+    if (hostname === "vimeo.com" || hostname.endsWith(".vimeo.com") || hostname === "player.vimeo.com") {
+      return "vimeo";
+    }
+
     if (hostname === "facebook.com" || hostname.endsWith(".facebook.com") || hostname === "fb.watch") {
       return "facebook";
     }
@@ -131,62 +176,222 @@ function getPlatformFromUrl(input) {
   }
 }
 
-function escapeShellArg(value) {
-  return `"${String(value).replace(/(["\\$`])/g, "\\$1")}"`;
+function buildYoutubeLocalSetupMessage() {
+  if (YTDLP_COOKIES_FILE) {
+    return `Local YouTube downloads are configured to use cookies from ${YTDLP_COOKIES_FILE}. Re-export that cookies file from a signed-in browser and retry.`;
+  }
+
+  const parts = [
+    "Local YouTube downloads need Chrome cookies.",
+    "Sign into YouTube in local Chrome and set YTDLP_COOKIES_FROM_BROWSER=chrome.",
+    "If Chrome is open, fully close it before retrying so yt-dlp can copy the cookie database.",
+  ];
+
+  if (YTDLP_BROWSER_PROFILE) {
+    parts.push(`Current profile: ${YTDLP_BROWSER_PROFILE}.`);
+  } else {
+    parts.push("If needed, also set YTDLP_BROWSER_PROFILE=Default.");
+  }
+
+  return parts.join(" ");
+}
+
+function buildInstagramLocalSetupMessage() {
+  if (YTDLP_COOKIES_FILE) {
+    return `Local Instagram downloads are configured to use cookies from ${YTDLP_COOKIES_FILE}. Re-export that cookies file from a signed-in browser and retry.`;
+  }
+
+  const parts = [
+    "Local Instagram downloads may need browser cookies.",
+    "Sign into Instagram in local Chrome and keep YTDLP_COOKIES_FROM_BROWSER=chrome set.",
+    "If Chrome is open, fully close it before retrying so yt-dlp can copy the cookie database.",
+  ];
+
+  if (YTDLP_BROWSER_PROFILE) {
+    parts.push(`Current profile: ${YTDLP_BROWSER_PROFILE}.`);
+  } else {
+    parts.push("If needed, also set YTDLP_BROWSER_PROFILE=Default.");
+  }
+
+  return parts.join(" ");
+}
+
+function isInstagramAuthRequired(stderrText) {
+  const normalized = String(stderrText || "").toLowerCase();
+  const authHints = [
+    "requested content is not available",
+    "rate-limit reached",
+    "login required",
+    "use --cookies-from-browser",
+    "use --cookies",
+    "private",
+    "not available",
+  ];
+  return authHints.some((hint) => normalized.includes(hint));
+}
+
+function mapYtDlpFailure(platform, error, stderr) {
+  const stderrText = String(stderr || "").trim();
+  const normalized = stderrText.toLowerCase();
+
+  if (error.killed || error.signal === "SIGTERM") {
+    const timeoutError = new Error("yt-dlp request timed out");
+    timeoutError.statusCode = 504;
+    return timeoutError;
+  }
+
+  if (platform === "facebook" && normalized.includes("[facebook]") && normalized.includes("no video formats found")) {
+    const fbError = new Error(
+      "This Facebook video is unavailable for direct download (private/restricted/login-required). Try a public Facebook video permalink."
+    );
+    fbError.statusCode = 422;
+    fbError.details = stderrText || error.message;
+    return fbError;
+  }
+
+  if (platform === "youtube") {
+    const setupHints = [
+      "cookies.txt",
+      "could not find cookies file",
+      "failed to load cookies",
+      "netscape cookie file",
+      "cookies-from-browser",
+      "could not copy chrome cookie database",
+      "failed to decrypt",
+      "cannot decrypt",
+      "browser cookies",
+      "could not find chrome",
+      "permission denied",
+      "sqlite",
+    ];
+    if (setupHints.some((hint) => normalized.includes(hint))) {
+      const ytCookieError = new Error(buildYoutubeLocalSetupMessage());
+      ytCookieError.statusCode = 422;
+      ytCookieError.details = stderrText || error.message;
+      return ytCookieError;
+    }
+
+    const authHints = [
+      "sign in to confirm you’re not a bot",
+      "sign in to confirm you're not a bot",
+      "use --cookies-from-browser",
+      "use --cookies",
+      "video unavailable",
+      "this video is unavailable",
+      "age-restricted",
+      "private video",
+      "members-only",
+      "login required",
+      "precondition check failed",
+    ];
+    if (authHints.some((hint) => normalized.includes(hint))) {
+      const ytAccessError = new Error(
+        "YouTube blocked this request. Try a public YouTube video and make sure local Chrome is signed in so yt-dlp can read cookies."
+      );
+      ytAccessError.statusCode = 422;
+      ytAccessError.details = stderrText || error.message;
+      return ytAccessError;
+    }
+  }
+
+  if (platform === "instagram") {
+    const setupHints = [
+      "cookies.txt",
+      "could not find cookies file",
+      "failed to load cookies",
+      "netscape cookie file",
+      "cookies-from-browser",
+      "could not copy chrome cookie database",
+      "failed to decrypt",
+      "cannot decrypt",
+      "browser cookies",
+      "could not find chrome",
+      "permission denied",
+      "sqlite",
+    ];
+    if (setupHints.some((hint) => normalized.includes(hint))) {
+      const igCookieError = new Error(buildInstagramLocalSetupMessage());
+      igCookieError.statusCode = 422;
+      igCookieError.details = stderrText || error.message;
+      return igCookieError;
+    }
+
+    const authHints = [
+      "requested content is not available",
+      "rate-limit reached",
+      "login required",
+      "use --cookies-from-browser",
+      "use --cookies",
+      "private",
+      "not available",
+    ];
+    if (authHints.some((hint) => normalized.includes(hint))) {
+      const igAccessError = new Error(
+        "Instagram blocked this reel or requires login. Try again after signing into Instagram in local Chrome and fully closing Chrome before retrying."
+      );
+      igAccessError.statusCode = 422;
+      igAccessError.details = stderrText || error.message;
+      return igAccessError;
+    }
+  }
+
+  const commandError = new Error("failed to fetch video metadata");
+  commandError.statusCode = 502;
+  commandError.details = stderrText || error.message;
+  return commandError;
 }
 
 function runYtDlp(url, requestId) {
-  const command = buildYtDlpCommand(url);
+  const platform = getPlatformFromUrl(url);
+  const command = buildYtDlpCommand(url, { platform, forceAuth: platform === "youtube" });
   console.log(`[${requestId}] executing: ${command}`);
 
   return new Promise((resolve, reject) => {
-    const child = exec(
-      command,
-      {
-        timeout: REQUEST_TIMEOUT_MS,
-        maxBuffer: 10 * 1024 * 1024,
-        windowsHide: true,
-      },
-      (error, stdout, stderr) => {
-        if (stderr && stderr.trim()) {
-          console.error(`[${requestId}] yt-dlp stderr: ${stderr.trim()}`);
-        }
-
-        if (error) {
-          if (error.killed || error.signal === "SIGTERM") {
-            const timeoutError = new Error("yt-dlp request timed out");
-            timeoutError.statusCode = 504;
-            return reject(timeoutError);
+    const executeCommand = (commandToRun, onFailure) => {
+      const child = exec(
+        commandToRun,
+        {
+          timeout: REQUEST_TIMEOUT_MS,
+          maxBuffer: 10 * 1024 * 1024,
+          windowsHide: true,
+        },
+        (error, stdout, stderr) => {
+          if (stderr && stderr.trim()) {
+            console.error(`[${requestId}] yt-dlp stderr: ${stderr.trim()}`);
           }
 
-          const stderrText = String(stderr || "").toLowerCase();
-          if (stderrText.includes("[facebook]") && stderrText.includes("no video formats found")) {
-            const fbError = new Error(
-              "This Facebook video is unavailable for direct download (private/restricted/login-required). Try a public Facebook video permalink."
-            );
-            fbError.statusCode = 422;
-            fbError.details = stderr ? stderr.trim() : error.message;
-            return reject(fbError);
+          if (error) {
+            return onFailure(error, stderr);
           }
 
-          const commandError = new Error("failed to fetch video metadata");
-          commandError.statusCode = 502;
-          commandError.details = stderr ? stderr.trim() : error.message;
-          return reject(commandError);
+          try {
+            resolve(JSON.parse(stdout));
+          } catch {
+            const parseError = new Error("invalid yt-dlp response");
+            parseError.statusCode = 502;
+            reject(parseError);
+          }
         }
+      );
 
-        try {
-          resolve(JSON.parse(stdout));
-        } catch {
-          const parseError = new Error("invalid yt-dlp response");
-          parseError.statusCode = 502;
-          reject(parseError);
-        }
+      child.on("error", (err) => {
+        console.error(`[${requestId}] process error: ${err.message}`);
+      });
+    };
+
+    executeCommand(command, (error, stderr) => {
+      const shouldRetryInstagramWithAuth =
+        platform === "instagram" && getAuthArgsForPlatform(platform) && isInstagramAuthRequired(stderr);
+
+      if (shouldRetryInstagramWithAuth) {
+        const retryCommand = buildYtDlpCommand(url, { platform, forceAuth: true });
+        console.log(`[${requestId}] retrying with auth: ${retryCommand}`);
+        return executeCommand(retryCommand, (retryError, retryStderr) => {
+          reject(mapYtDlpFailure(platform, retryError, retryStderr));
+        });
       }
-    );
 
-    child.on("error", (err) => {
-      console.error(`[${requestId}] process error: ${err.message}`);
+      reject(mapYtDlpFailure(platform, error, stderr));
     });
   });
 }
@@ -392,7 +597,13 @@ function normalizeFormats(rawFormats, title, baseUrl) {
       if (format.vcodec === "none") return false;
       if (typeof format.url !== "string" || !/^https?:\/\//i.test(format.url)) return false;
       const protocol = String(format.protocol || "").toLowerCase();
+      const formatId = String(format.format_id || "").toLowerCase();
+      const url = String(format.url || "").toLowerCase();
       if (protocol.includes("m3u8")) return false;
+      if (protocol.includes("dash")) return false;
+      if (protocol.includes("http_dash_segments")) return false;
+      if (formatId.startsWith("dash-")) return false;
+      if (url.includes(".mpd")) return false;
       return true;
     })
     .sort((a, b) => (inferHeight(b) || 0) - (inferHeight(a) || 0))
@@ -402,13 +613,16 @@ function normalizeFormats(rawFormats, title, baseUrl) {
       seen.add(key);
       return true;
     })
-    .map((format) => ({
-      format_id: String(format.format_id),
-      ext: guessExt(format),
-      quality: getQualityLabel(format),
-      previewUrl: `${baseUrl}/api/stream?t=${encodeURIComponent(mintStreamToken(format, title))}&inline=1`,
-      url: `${baseUrl}/api/stream?t=${encodeURIComponent(mintStreamToken(format, title))}&download=1`,
-    }));
+    .map((format) => {
+      const streamToken = mintStreamToken(format, title);
+      return {
+        format_id: String(format.format_id),
+        ext: guessExt(format),
+        quality: getQualityLabel(format),
+        previewUrl: `${baseUrl}/api/stream?t=${encodeURIComponent(streamToken)}&inline=1`,
+        url: `${baseUrl}/api/stream?t=${encodeURIComponent(streamToken)}&download=1`,
+      };
+    });
 }
 
 app.post("/api/download", async (req, res, next) => {
@@ -475,7 +689,19 @@ app.get("/api/thumb", async (req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.status(200);
 
-    Readable.fromWeb(upstream.body).pipe(res);
+    const upstreamStream = Readable.fromWeb(upstream.body);
+    upstreamStream.on("error", (streamError) => {
+      console.error(`[${req.requestId}] thumbnail stream error: ${streamError.message}`);
+    });
+
+    try {
+      await pipeline(upstreamStream, res);
+    } catch (streamError) {
+      if (!res.headersSent) {
+        return res.status(502).json({ error: "thumbnail stream failed" });
+      }
+      res.destroy(streamError);
+    }
   } catch (error) {
     if (error?.name === "TimeoutError") {
       return res.status(504).json({ error: "thumbnail request timed out" });
@@ -513,7 +739,7 @@ app.get("/api/stream", async (req, res, next) => {
       method: "GET",
       headers,
       redirect: "follow",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(STREAM_FETCH_TIMEOUT_MS),
     });
 
     if (!upstream.ok && upstream.status !== 206) {
@@ -548,7 +774,19 @@ app.get("/api/stream", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     res.status(upstream.status === 206 ? 206 : 200);
 
-    Readable.fromWeb(upstream.body).pipe(res);
+    const upstreamStream = Readable.fromWeb(upstream.body);
+    upstreamStream.on("error", (streamError) => {
+      console.error(`[${req.requestId}] upstream stream error: ${streamError.message}`);
+    });
+
+    try {
+      await pipeline(upstreamStream, res);
+    } catch (streamError) {
+      if (!res.headersSent) {
+        return res.status(502).json({ error: "stream forwarding failed" });
+      }
+      res.destroy(streamError);
+    }
   } catch (error) {
     if (error?.name === "TimeoutError") {
       return res.status(504).json({ error: "stream request timed out" });
